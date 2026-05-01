@@ -6,10 +6,8 @@ import uuid
 import shutil
 import asyncio
 import subprocess
-import threading
 from pathlib import Path
 
-from flask import Flask
 import yt_dlp
 from yt_dlp.utils import DateRange
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -58,6 +56,7 @@ DAILY_FILE = BASE_DIR / "daily_usage.json"
 ADS_FILE = BASE_DIR / "ads.json"
 BAN_FILE = BASE_DIR / "banned.json"
 SETTINGS_FILE = BASE_DIR / "settings.json"
+LOGS_FILE = BASE_DIR / "logs.json"
 BOT_CONFIG_FILE = BASE_DIR / "bot_config.json"
 
 BASE_DIR.mkdir(exist_ok=True)
@@ -65,6 +64,11 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 MAX_FILE_MB = 49
 CHECK_INTERVAL_SECONDS = 3600
+CLEANUP_INTERVAL_SECONDS = 24 * 3600
+DOWNLOADS_TTL_SECONDS = 24 * 3600
+DAILY_KEEP_DAYS = 7
+USED_CODES_KEEP_DAYS = 30
+MAX_HISTORY_ITEMS_PER_CHAT = 300
 
 DEFAULT_BOT_CONFIG = {
     "required_channel": "@NATOU_DZ",
@@ -87,29 +91,6 @@ DEFAULT_SETTINGS = {
     "send_as": "document",          # document / video
     "preferred_quality": "normal",  # normal / best
 }
-
-
-
-# =========================================================
-# RENDER WEB SERVER
-# =========================================================
-
-web_app = Flask(__name__)
-
-
-@web_app.get("/")
-def home():
-    return "TikSave Pro is running", 200
-
-
-@web_app.get("/health")
-def health():
-    return "OK", 200
-
-
-def run_web_server():
-    port = int(os.getenv("PORT", "10000"))
-    web_app.run(host="0.0.0.0", port=port)
 
 
 # =========================================================
@@ -282,6 +263,35 @@ def add_vip(user_id, days, user_limit, watch_limit, link_quality, user_quality, 
 def remove_vip(user_id):
     vip = load_json(VIP_FILE, {})
     vip.pop(str(user_id), None)
+    save_json(VIP_FILE, vip)
+
+
+def extend_vip(user_id, extra_days):
+    vip = load_json(VIP_FILE, {})
+    uid = str(user_id)
+    now = int(time.time())
+
+    data = vip.get(uid)
+    if not data:
+        cfg = get_bot_config()
+        add_vip(
+            user_id=user_id,
+            days=int(extra_days),
+            user_limit=cfg["default_vip_user_limit"],
+            watch_limit=cfg["default_vip_watch_limit"],
+            link_quality=cfg["default_vip_link_quality"],
+            user_quality=cfg["default_vip_user_quality"],
+            date_filter=cfg["default_vip_date_filter"],
+        )
+        return
+
+    current_exp = int(data.get("expires_at", now))
+    if current_exp < now:
+        current_exp = now
+
+    data["expires_at"] = current_exp + int(extra_days) * 86400
+    data["days"] = int(data.get("days", 0)) + int(extra_days)
+    vip[uid] = data
     save_json(VIP_FILE, vip)
 
 
@@ -482,6 +492,36 @@ async def broadcast_to_users(bot, text):
     return sent, failed
 
 
+
+def add_log(action, user_id=None, detail=""):
+    logs = load_json(LOGS_FILE, [])
+    logs.append({
+        "time": int(time.time()),
+        "action": action,
+        "user_id": int(user_id) if str(user_id).isdigit() else str(user_id),
+        "detail": str(detail)[:500],
+    })
+    if len(logs) > 200:
+        logs = logs[-200:]
+    save_json(LOGS_FILE, logs)
+
+
+def logs_text(limit=30):
+    logs = load_json(LOGS_FILE, [])
+    if not logs:
+        return "<b>السجلات</b>\n\nلا توجد سجلات بعد."
+
+    lines = ["<b>آخر السجلات</b>\n"]
+    for item in reversed(logs[-limit:]):
+        t = time.strftime("%Y-%m-%d %H:%M", time.localtime(item.get("time", 0)))
+        lines.append(
+            f"{t}\n"
+            f"User: <code>{item.get('user_id')}</code>\n"
+            f"Action: <b>{item.get('action')}</b>\n"
+            f"{item.get('detail', '')}\n"
+        )
+    return "\n".join(lines)
+
 # =========================================================
 # DAILY USAGE
 # =========================================================
@@ -663,6 +703,26 @@ def save_watchlist(data):
     save_json(WATCH_FILE, data)
 
 
+
+# =========================================================
+# STATE SYSTEM
+# =========================================================
+
+STATE_KEY = "waiting_for"
+
+
+def set_state(context, state):
+    context.user_data[STATE_KEY] = state
+
+
+def get_state(context):
+    return context.user_data.get(STATE_KEY)
+
+
+def clear_state(context):
+    context.user_data.pop(STATE_KEY, None)
+
+
 # =========================================================
 # MENUS
 # =========================================================
@@ -749,6 +809,7 @@ def admin_menu():
             InlineKeyboardButton("إعدادات البوت", callback_data="admin_config"),
         ],
         [
+            InlineKeyboardButton("السجلات", callback_data="admin_logs"),
             InlineKeyboardButton("الإحصائيات", callback_data="admin_stats"),
         ],
         [
@@ -766,6 +827,10 @@ def admin_vip_menu():
         [
             InlineKeyboardButton("قائمة VIP", callback_data="admin_vips"),
             InlineKeyboardButton("حذف VIP", callback_data="admin_remove_vip"),
+        ],
+        [
+            InlineKeyboardButton("إضافة VIP", callback_data="admin_add_vip"),
+            InlineKeyboardButton("تمديد VIP", callback_data="admin_extend_vip"),
         ],
         [
             InlineKeyboardButton("رجوع للأدمن", callback_data="admin_panel"),
@@ -1048,9 +1113,8 @@ Free:
 # COMMANDS
 # =========================================================
 
-
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+    clear_state(context)
     await send_html(
         update.message,
         "تم إلغاء العملية الحالية.\n\n" + welcome_text(update.effective_user.id),
@@ -1058,7 +1122,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+    clear_state(context)
     register_user(update.effective_user)
     user_id = update.effective_user.id
 
@@ -1150,7 +1214,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(q.from_user)
 
     if data in ["cancel_current", "back_main"]:
-        context.user_data.clear()
+        clear_state(context)
         await edit_html(q, welcome_text(user_id), reply_markup=main_menu(user_id))
         return
 
@@ -1187,7 +1251,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("تسجيل اللايف متاح لـ VIP فقط.", show_alert=True)
             return
 
-        context.user_data["waiting_for"] = "download_live"
+        set_state(context, "download_live")
         await edit_html(
             q,
             "أرسل رابط اللايف والمدة بالدقائق.\n\nمثال:\n<code>https://www.tiktok.com/@username/live 60</code>",
@@ -1228,12 +1292,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "download_link":
-        context.user_data["waiting_for"] = "download_link"
+        set_state(context, "download_link")
         await q.edit_message_text("أرسل رابط فيديو TikTok:", reply_markup=back_menu())
         return
 
     if data == "download_user":
-        context.user_data["waiting_for"] = "download_user"
+        set_state(context, "download_user")
         await q.edit_message_text("أرسل يوزر TikTok:\nمثال: @username", reply_markup=back_menu())
         return
 
@@ -1241,17 +1305,17 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not get_plan(user_id)["date_filter"]:
             await q.answer("الميزة متاحة لـ VIP فقط.", show_alert=True)
             return
-        context.user_data["waiting_for"] = "download_fromto"
+        set_state(context, "download_fromto")
         await q.edit_message_text("📆 أرسل هكذا:\n\n@username 2026-04-01 2026-05-01", reply_markup=back_menu())
         return
 
     if data == "watch_add":
-        context.user_data["waiting_for"] = "watch_add"
+        set_state(context, "watch_add")
         await q.edit_message_text("أرسل يوزر الحساب لمراقبته:", reply_markup=back_menu())
         return
 
     if data == "watch_remove":
-        context.user_data["waiting_for"] = "watch_remove"
+        set_state(context, "watch_remove")
         await q.edit_message_text("أرسل يوزر الحساب لإيقاف المراقبة:", reply_markup=back_menu())
         return
 
@@ -1300,7 +1364,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "redeem_code":
-        context.user_data["waiting_for"] = "redeem_code"
+        set_state(context, "redeem_code")
         await q.edit_message_text("أرسل كود VIP الآن:", reply_markup=back_menu())
         return
 
@@ -1315,7 +1379,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_create_code":
         if not is_admin(user_id):
             return
-        context.user_data["waiting_for"] = "admin_create_code"
+        set_state(context, "admin_create_code")
         await q.edit_message_text(
             "🎟 أرسل إعدادات الكود هكذا:\n\n"
             "days user_limit watch_limit link_quality user_quality date_filter\n\n"
@@ -1338,13 +1402,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin_set_ad":
         if is_admin(user_id):
-            context.user_data["waiting_for"] = "admin_set_ad"
+            set_state(context, "admin_set_ad")
             await q.edit_message_text("✏️ أرسل نص الإعلان الجديد:", reply_markup=admin_menu())
         return
 
     if data == "admin_broadcast":
         if is_admin(user_id):
-            context.user_data["waiting_for"] = "admin_broadcast"
+            set_state(context, "admin_broadcast")
             await q.edit_message_text("📣 أرسل نص الإعلان الجماعي:", reply_markup=admin_menu())
         return
 
@@ -1386,7 +1450,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "cfg_set_channel" and is_admin(user_id):
-        context.user_data["waiting_for"] = "cfg_set_channel"
+        set_state(context, "cfg_set_channel")
         await q.edit_message_text(
             "📢 أرسل القناة والرابط هكذا:\n\n@CHANNEL https://t.me/CHANNEL",
             reply_markup=admin_config_menu()
@@ -1395,20 +1459,69 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin_ban":
         if is_admin(user_id):
-            context.user_data["waiting_for"] = "admin_ban"
+            set_state(context, "admin_ban")
             await q.edit_message_text("🚫 أرسل ID المستخدم لحظره:", reply_markup=admin_menu())
         return
 
     if data == "admin_unban":
         if is_admin(user_id):
-            context.user_data["waiting_for"] = "admin_unban"
+            set_state(context, "admin_unban")
             await q.edit_message_text("✅ أرسل ID المستخدم لفك الحظر:", reply_markup=admin_menu())
+        return
+
+
+    if data == "admin_add_vip":
+        if is_admin(user_id):
+            set_state(context, "admin_add_vip")
+            await q.edit_message_text(
+                "أرسل بيانات VIP بهذا الشكل:\n\nID days user_limit watch_limit link_quality user_quality date_filter\n\nمثال:\n1853431053 30 15 5 best best yes",
+                reply_markup=admin_vip_menu()
+            )
+        return
+
+    if data == "admin_extend_vip":
+        if is_admin(user_id):
+            set_state(context, "admin_extend_vip")
+            await q.edit_message_text(
+                "أرسل ID والمدة الإضافية بالأيام:\n\n1853431053 30",
+                reply_markup=admin_vip_menu()
+            )
         return
 
     if data == "admin_remove_vip":
         if is_admin(user_id):
-            context.user_data["waiting_for"] = "admin_remove_vip"
+            set_state(context, "admin_remove_vip")
             await q.edit_message_text("➖ أرسل ID المستخدم لحذف VIP:", reply_markup=admin_menu())
+        return
+
+
+    if data == "admin_cleanup":
+        if not is_admin(user_id):
+            return
+
+        report = await asyncio.to_thread(cleanup_old_data)
+        text = f"""<b>تنظيف البيانات</b>
+
+تم تنظيف البيانات المؤقتة.
+
+الملفات المؤقتة المحذوفة: <b>{report["downloads_removed"]}</b>
+مستخدمو daily_usage المنظفون: <b>{report["daily_users_cleaned"]}</b>
+الأكواد المستعملة المحذوفة: <b>{report["codes_removed"]}</b>
+السجلات المختصرة: <b>{report["history_trimmed"]}</b>
+"""
+        try:
+            await edit_html(q, text, reply_markup=admin_menu())
+        except Exception:
+            await q.edit_message_text(text, reply_markup=admin_menu(), parse_mode="HTML")
+        return
+
+
+    if data == "admin_logs":
+        if is_admin(user_id):
+            try:
+                await edit_html(q, logs_text(), reply_markup=admin_menu())
+            except Exception:
+                await q.edit_message_text(logs_text(), reply_markup=admin_menu(), parse_mode="HTML")
         return
 
     if data == "admin_stats":
@@ -1449,10 +1562,10 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
     user_id = update.effective_user.id
-    waiting = context.user_data.get("waiting_for")
+    waiting = get_state(context)
 
     if text in ["/cancel", "cancel", "رجوع", "إلغاء", "الغاء"]:
-        context.user_data.clear()
+        clear_state(context)
         await send_html(update.message, welcome_text(user_id), reply_markup=main_menu(user_id))
         return
 
@@ -1467,7 +1580,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     if waiting == "download_live":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
 
         if not is_vip(user_id) and not is_admin(user_id):
             await update.message.reply_text("تسجيل اللايف متاح لـ VIP فقط.")
@@ -1492,7 +1605,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if waiting == "download_link":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         if not is_tiktok_url(text):
             await update.message.reply_text("❌ هذا ليس رابط TikTok.", reply_markup=main_menu(user_id))
             return
@@ -1500,12 +1613,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if waiting == "download_user":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         await process_username(update, clean_username(text))
         return
 
     if waiting == "download_fromto":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         parts = text.split()
         if len(parts) < 3:
             await update.message.reply_text("❌ الصيغة خطأ.\nمثال:\n@username 2026-04-01 2026-05-01")
@@ -1514,23 +1627,82 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if waiting == "watch_add":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         await add_watch(update, clean_username(text))
         return
 
     if waiting == "watch_remove":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         await remove_watch(update, clean_username(text))
         return
 
     if waiting == "redeem_code":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         ok, msg = redeem_code(user_id, text)
         await update.message.reply_text(msg, reply_markup=main_menu(user_id))
         return
 
+
+    if waiting == "admin_add_vip":
+        clear_state(context)
+        if not is_admin(user_id):
+            return
+
+        parts = text.split()
+        if len(parts) < 7:
+            await update.message.reply_text(
+                "الصيغة خطأ.\nمثال:\n1853431053 30 15 5 best best yes",
+                reply_markup=admin_vip_menu()
+            )
+            return
+
+        try:
+            target_id = int(parts[0])
+            days = int(parts[1])
+            user_limit = int(parts[2])
+            watch_limit = int(parts[3])
+            link_quality = parts[4]
+            user_quality = parts[5]
+            date_filter = parts[6].lower() in ["yes", "true", "1", "نعم"]
+        except Exception:
+            await update.message.reply_text("الأرقام غير صحيحة.", reply_markup=admin_vip_menu())
+            return
+
+        add_vip(target_id, days, user_limit, watch_limit, link_quality, user_quality, date_filter)
+        add_log("admin_add_vip", user_id, f"target={target_id}, days={days}")
+        await update.message.reply_text(
+            f"تمت إضافة VIP للمستخدم: {target_id}\nالمدة: {days} يوم",
+            reply_markup=admin_vip_menu()
+        )
+        return
+
+    if waiting == "admin_extend_vip":
+        clear_state(context)
+        if not is_admin(user_id):
+            return
+
+        parts = text.split()
+        if len(parts) < 2:
+            await update.message.reply_text("الصيغة خطأ.\nمثال:\n1853431053 30", reply_markup=admin_vip_menu())
+            return
+
+        try:
+            target_id = int(parts[0])
+            days = int(parts[1])
+        except Exception:
+            await update.message.reply_text("الأرقام غير صحيحة.", reply_markup=admin_vip_menu())
+            return
+
+        extend_vip(target_id, days)
+        add_log("admin_extend_vip", user_id, f"target={target_id}, days={days}")
+        await update.message.reply_text(
+            f"تم تمديد VIP للمستخدم: {target_id}\nالمدة الإضافية: {days} يوم",
+            reply_markup=admin_vip_menu()
+        )
+        return
+
     if waiting == "admin_create_code":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         if not is_admin(user_id):
             return
 
@@ -1566,14 +1738,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if waiting == "admin_set_ad":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         if is_admin(user_id):
             set_ad(True, text)
             await update.message.reply_text("✅ تم تغيير الإعلان وتفعيله.", reply_markup=admin_menu())
         return
 
     if waiting == "admin_broadcast":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         if is_admin(user_id):
             msg = await update.message.reply_text("📣 جاري إرسال الإعلان الجماعي...")
             sent, failed = await broadcast_to_users(context.bot, text)
@@ -1581,7 +1753,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if waiting == "cfg_set_channel":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         if is_admin(user_id):
             parts = text.split()
             if len(parts) < 2 or not parts[0].startswith("@"):
@@ -1593,21 +1765,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if waiting == "admin_ban":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         if is_admin(user_id):
             ban_user(text)
             await update.message.reply_text(f"🚫 تم حظر: {text}", reply_markup=admin_menu())
         return
 
     if waiting == "admin_unban":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         if is_admin(user_id):
             unban_user(text)
             await update.message.reply_text(f"✅ تم فك الحظر: {text}", reply_markup=admin_menu())
         return
 
     if waiting == "admin_remove_vip":
-        context.user_data["waiting_for"] = None
+        clear_state(context)
         if is_admin(user_id):
             remove_vip(text)
             await update.message.reply_text(f"➖ تم حذف VIP من: {text}", reply_markup=admin_menu())
@@ -1675,6 +1847,7 @@ async def process_link(update, url):
 
         if ok:
             add_history(chat_id, history_id)
+            add_log("download_link", user_id, url)
             await msg.edit_text("✅ تم التحميل والإرسال.")
         else:
             await msg.edit_text("❌ لم يتم الإرسال.")
@@ -1759,6 +1932,7 @@ async def process_username(update, username, date_after=None, date_before=None):
 
         if sent > 0:
             add_daily_usage(user_id, sent)
+            add_log("download_user", user_id, f"@{username} | sent={sent}")
 
         await msg.edit_text(f"✅ انتهى.\n📤 أُرسل: {sent}\n⏭ تخطى: {skipped}")
         await send_ad_if_enabled(update.message, user_id)
@@ -2087,6 +2261,98 @@ async def stop_live_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("تم إيقاف تسجيل اللايف.")
 
 
+
+# =========================================================
+# DATA CLEANUP
+# =========================================================
+
+def cleanup_old_data():
+    now = int(time.time())
+    report = {
+        "downloads_removed": 0,
+        "daily_users_cleaned": 0,
+        "codes_removed": 0,
+        "history_trimmed": 0,
+    }
+
+    # 1) حذف ملفات ومجلدات التحميل المؤقتة
+    if DOWNLOAD_DIR.exists():
+        for item in list(DOWNLOAD_DIR.iterdir()):
+            try:
+                age = now - int(item.stat().st_mtime)
+                if age > DOWNLOADS_TTL_SECONDS:
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
+                    else:
+                        item.unlink(missing_ok=True)
+                    report["downloads_removed"] += 1
+            except Exception:
+                pass
+
+    # 2) تنظيف daily_usage: نترك آخر 7 أيام فقط
+    daily = load_json(DAILY_FILE, {})
+    keep_days = {
+        time.strftime("%Y-%m-%d", time.localtime(now - i * 86400))
+        for i in range(DAILY_KEEP_DAYS)
+    }
+
+    for uid in list(daily.keys()):
+        if not isinstance(daily.get(uid), dict):
+            daily.pop(uid, None)
+            report["daily_users_cleaned"] += 1
+            continue
+
+        old_len = len(daily[uid])
+        daily[uid] = {
+            day: count for day, count in daily[uid].items()
+            if day in keep_days
+        }
+
+        if len(daily[uid]) != old_len:
+            report["daily_users_cleaned"] += 1
+
+        if not daily[uid]:
+            daily.pop(uid, None)
+
+    save_json(DAILY_FILE, daily)
+
+    # 3) حذف الأكواد المستعملة القديمة بعد 30 يوم
+    codes = load_json(CODES_FILE, {})
+    for code_key in list(codes.keys()):
+        item = codes.get(code_key, {})
+        if item.get("used") and item.get("used_at"):
+            try:
+                if now - int(item["used_at"]) > USED_CODES_KEEP_DAYS * 86400:
+                    codes.pop(code_key, None)
+                    report["codes_removed"] += 1
+            except Exception:
+                pass
+
+    save_json(CODES_FILE, codes)
+
+    # 4) تقصير سجل التحميل لكل شات
+    history = load_json(HISTORY_FILE, {})
+    for chat_id in list(history.keys()):
+        items = history.get(chat_id)
+        if isinstance(items, list) and len(items) > MAX_HISTORY_ITEMS_PER_CHAT:
+            history[chat_id] = items[-MAX_HISTORY_ITEMS_PER_CHAT:]
+            report["history_trimmed"] += 1
+
+    save_json(HISTORY_FILE, history)
+
+    # 5) تقصير logs
+    logs = load_json(LOGS_FILE, [])
+    if isinstance(logs, list) and len(logs) > 200:
+        save_json(LOGS_FILE, logs[-200:])
+
+    return report
+
+
+async def cleanup_job(context: ContextTypes.DEFAULT_TYPE):
+    report = await asyncio.to_thread(cleanup_old_data)
+    print(f"Cleanup done: {report}")
+
+
 # =========================================================
 # MAIN
 # =========================================================
@@ -2122,10 +2388,16 @@ def main():
             interval=CHECK_INTERVAL_SECONDS,
             first=60
         )
+        app.job_queue.run_repeating(
+            cleanup_job,
+            interval=CLEANUP_INTERVAL_SECONDS,
+            first=300
+        )
     else:
         print('⚠️ ثبّت JobQueue: pip install -U "python-telegram-bot[job-queue]"')
 
-    threading.Thread(target=run_web_server, daemon=True).start()
+    startup_report = cleanup_old_data()
+    print(f"Startup cleanup: {startup_report}")
 
     print(f"{BOT_LOGO} {BOT_NAME} is running...")
     app.run_polling()
