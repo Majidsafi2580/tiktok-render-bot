@@ -827,7 +827,7 @@ def admin_config_menu():
 
 def back_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("رجوع", callback_data="back_main")]
+        [InlineKeyboardButton("إلغاء والرجوع", callback_data="cancel_current")]
     ])
 
 # =========================================================
@@ -1048,7 +1048,17 @@ Free:
 # COMMANDS
 # =========================================================
 
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await send_html(
+        update.message,
+        "تم إلغاء العملية الحالية.\n\n" + welcome_text(update.effective_user.id),
+        reply_markup=main_menu(update.effective_user.id),
+    )
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     register_user(update.effective_user)
     user_id = update.effective_user.id
 
@@ -1139,6 +1149,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     register_user(q.from_user)
 
+    if data in ["cancel_current", "back_main"]:
+        context.user_data.clear()
+        await edit_html(q, welcome_text(user_id), reply_markup=main_menu(user_id))
+        return
+
+
     if is_banned(user_id) and not is_admin(user_id):
         await q.answer("تم حظرك.", show_alert=True)
         return
@@ -1209,11 +1225,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "admin_users_list":
         if is_admin(user_id):
             await q.edit_message_text(list_users_text(), reply_markup=admin_users_menu(), parse_mode="HTML")
-        return
-
-    if data == "back_main":
-        context.user_data["waiting_for"] = None
-        await edit_html(q, welcome_text(user_id), reply_markup=main_menu(user_id))
         return
 
     if data == "download_link":
@@ -1439,6 +1450,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     user_id = update.effective_user.id
     waiting = context.user_data.get("waiting_for")
+
+    if text in ["/cancel", "cancel", "رجوع", "إلغاء", "الغاء"]:
+        context.user_data.clear()
+        await send_html(update.message, welcome_text(user_id), reply_markup=main_menu(user_id))
+        return
+
 
     if is_banned(user_id) and not is_admin(user_id):
         await update.message.reply_text("🚫 تم حظرك من استعمال البوت.")
@@ -2089,6 +2106,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", start))
     app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
     app.add_handler(CommandHandler("admin", admin_cmd))
     app.add_handler(CommandHandler("redeem", redeem_cmd))
     app.add_handler(CommandHandler("gencode", gencode_cmd))
