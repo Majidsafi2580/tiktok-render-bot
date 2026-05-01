@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: tiktok-render-bot
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
