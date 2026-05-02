@@ -927,12 +927,17 @@ async def send_html(message, text, reply_markup=None):
 
 
 async def edit_html(query, text, reply_markup=None):
-    await query.edit_message_text(
-        text,
-        reply_markup=reply_markup,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        if "Message is not modified" in str(e):
+            return
+        raise
 
 
 # =========================================================
