@@ -5,8 +5,6 @@ import time
 import uuid
 import shutil
 import asyncio
-import threading
-from flask import Flask
 import subprocess
 from pathlib import Path
 
@@ -40,6 +38,12 @@ BOT_NAME = "TikSave Pro"
 BOT_LOGO = "⚡🎬"
 ADMIN_USERNAME = "@madjid_d14"
 
+VIP_PACKAGES = {
+    "7": {"name": "VIP أسبوع", "days": 7, "user_limit": 15, "watch_limit": 3, "link_quality": "best", "user_quality": "best", "date_filter": True},
+    "30": {"name": "VIP شهر", "days": 30, "user_limit": 15, "watch_limit": 5, "link_quality": "best", "user_quality": "best", "date_filter": True},
+    "90": {"name": "VIP Premium", "days": 90, "user_limit": 50, "watch_limit": 10, "link_quality": "best", "user_quality": "best", "date_filter": True},
+}
+
 LIVE_TASKS = {}
 ACTIVE_USERS = set()
 LIVE_SEGMENT_SECONDS = 240
@@ -59,6 +63,7 @@ ADS_FILE = BASE_DIR / "ads.json"
 BAN_FILE = BASE_DIR / "banned.json"
 SETTINGS_FILE = BASE_DIR / "settings.json"
 LOGS_FILE = BASE_DIR / "logs.json"
+VIP_REQUESTS_FILE = BASE_DIR / "vip_requests.json"
 BOT_CONFIG_FILE = BASE_DIR / "bot_config.json"
 
 BASE_DIR.mkdir(exist_ok=True)
@@ -94,23 +99,7 @@ DEFAULT_SETTINGS = {
     "preferred_quality": "normal",  # normal / best
 }
 
-# =========================================================
-# RENDER WEB SERVER
-# =========================================================
 
-web_app = Flask(__name__)
-
-@web_app.get("/")
-def home():
-    return "TikSave Pro is running", 200
-
-@web_app.get("/health")
-def health():
-    return "OK", 200
-
-def run_web_server():
-    port = int(os.getenv("PORT", "10000"))
-    web_app.run(host="0.0.0.0", port=port)
 # =========================================================
 # JSON
 # =========================================================
@@ -381,6 +370,48 @@ def list_users_text(limit=30):
     return "\n".join(lines)
 
 
+
+def add_vip_request(user, package_key="30"):
+    requests = load_json(VIP_REQUESTS_FILE, [])
+    pkg = VIP_PACKAGES.get(str(package_key), VIP_PACKAGES["30"])
+
+    item = {
+        "time": int(time.time()),
+        "user_id": int(user.id),
+        "name": user.full_name,
+        "username": user.username,
+        "package": pkg["name"],
+        "days": pkg["days"],
+        "status": "new",
+    }
+
+    requests.append(item)
+    if len(requests) > 200:
+        requests = requests[-200:]
+
+    save_json(VIP_REQUESTS_FILE, requests)
+    return item
+
+
+def vip_requests_text(limit=30):
+    requests = load_json(VIP_REQUESTS_FILE, [])
+    if not requests:
+        return "<b>طلبات VIP</b>\n\nلا توجد طلبات حتى الآن."
+
+    lines = ["<b>آخر طلبات VIP</b>\n"]
+    for i, item in enumerate(reversed(requests[-limit:]), 1):
+        username = item.get("username")
+        username_text = f"@{username}" if username else "-"
+        t = time.strftime("%Y-%m-%d %H:%M", time.localtime(item.get("time", 0)))
+        lines.append(
+            f"{i}. <b>{item.get('name')}</b>\n"
+            f"ID: <code>{item.get('user_id')}</code>\n"
+            f"Username: {username_text}\n"
+            f"Package: {item.get('package')}\n"
+            f"Time: {t}\n"
+        )
+    return "\n".join(lines)
+
 # =========================================================
 # VIP CODES
 # =========================================================
@@ -539,6 +570,28 @@ def logs_text(limit=30):
             f"{item.get('detail', '')}\n"
         )
     return "\n".join(lines)
+
+
+async def broadcast_to_users_filtered(bot, text, target="all"):
+    users = load_json(USERS_FILE, {})
+    sent = 0
+    failed = 0
+
+    for uid in list(users.keys()):
+        try:
+            is_user_vip = is_vip(uid)
+            if target == "vip" and not is_user_vip:
+                continue
+            if target == "free" and is_user_vip:
+                continue
+
+            await bot.send_message(chat_id=int(uid), text=text)
+            sent += 1
+            await asyncio.sleep(0.06)
+        except Exception:
+            failed += 1
+
+    return sent, failed
 
 # =========================================================
 # DAILY USAGE
@@ -789,6 +842,9 @@ def vip_menu():
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("تفعيل كود", callback_data="redeem_code"),
+            InlineKeyboardButton("طلب VIP", callback_data="request_vip"),
+        ],
+        [
             InlineKeyboardButton("تواصل مع الأدمن", callback_data="contact_admin"),
         ],
         [
@@ -809,6 +865,7 @@ def watch_menu():
         ],
         [
             InlineKeyboardButton("قائمة الحسابات", callback_data="watchlist"),
+            InlineKeyboardButton("حذف الكل", callback_data="watch_clear_all"),
         ],
         [
             InlineKeyboardButton("رجوع", callback_data="back_main"),
@@ -844,6 +901,7 @@ def admin_vip_menu():
         ],
         [
             InlineKeyboardButton("قائمة VIP", callback_data="admin_vips"),
+            InlineKeyboardButton("طلبات VIP", callback_data="admin_vip_requests"),
             InlineKeyboardButton("حذف VIP", callback_data="admin_remove_vip"),
         ],
         [
@@ -864,7 +922,13 @@ def admin_ads_menu():
         ],
         [
             InlineKeyboardButton("تغيير الإعلان", callback_data="admin_set_ad"),
-            InlineKeyboardButton("إعلان جماعي", callback_data="admin_broadcast"),
+        ],
+        [
+            InlineKeyboardButton("إعلان للجميع", callback_data="admin_broadcast"),
+            InlineKeyboardButton("إعلان Free", callback_data="admin_broadcast_free"),
+        ],
+        [
+            InlineKeyboardButton("إعلان VIP", callback_data="admin_broadcast_vip"),
         ],
         [
             InlineKeyboardButton("رجوع للأدمن", callback_data="admin_panel"),
@@ -927,17 +991,12 @@ async def send_html(message, text, reply_markup=None):
 
 
 async def edit_html(query, text, reply_markup=None):
-    try:
-        await query.edit_message_text(
-            text,
-            reply_markup=reply_markup,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        if "Message is not modified" in str(e):
-            return
-        raise
+    await query.edit_message_text(
+        text,
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
 
 
 # =========================================================
@@ -994,28 +1053,31 @@ def status_text(user_id, chat_id):
     watch = load_watchlist().get(str(chat_id), [])
     settings = get_settings(chat_id)
 
-    send_text = "ملف" if settings["send_as"] == "document" else "فيديو"
+    send_text = "ملف أصلي" if settings["send_as"] == "document" else "فيديو مباشر"
     quality_text = "أفضل جودة" if settings["preferred_quality"] == "best" else "عادية"
     account = "VIP" if is_vip(user_id) else "Free"
 
     return f"""
 <b>الحالة</b>
 
-<b>الحساب</b>
+<b>حسابك</b>
 الخطة: <b>{account}</b>
 انتهاء VIP: <b>{vip_days_left(user_id)}</b>
 
-<b>الاستخدام اليومي</b>
-المستعمل: <b>{used}</b>
-الباقي: <b>{remaining}</b>
-الحد: <b>{plan["user_limit"]}</b>
+<b>استخدام اليوم</b>
+التحميل من حساب: <b>{used}</b> مستعمل
+الباقي اليوم: <b>{remaining}</b>
+الحد اليومي: <b>{plan["user_limit"]}</b>
 
 <b>المراقبة</b>
-الحسابات: <b>{len(watch)}</b> / <b>{plan["watch_limit"]}</b>
+الحسابات المراقبة: <b>{len(watch)}</b> / <b>{plan["watch_limit"]}</b>
 
-<b>الإعدادات</b>
+<b>الجودة والإرسال</b>
 الإرسال: <b>{send_text}</b>
 الجودة: <b>{quality_text}</b>
+جودة الرابط: <b>{plan["link_quality"]}</b>
+جودة الحساب: <b>{plan["user_quality"]}</b>
+تحميل حسب التاريخ: <b>{"نعم" if plan["date_filter"] else "لا"}</b>
 """
 
 
@@ -1052,12 +1114,16 @@ def vip_info_text(user_id):
 • تسجيل لايف وإرسال مقطع كل 4 دقائق
 • بدون إعلانات
 
+<b>الباقات</b>
+• VIP أسبوع: 7 أيام
+• VIP شهر: 30 يوم
+• VIP Premium: 90 يوم
+
 <b>حالتك</b>
 الخطة: <b>{"VIP" if is_vip(user_id) else "Free"}</b>
 انتهاء VIP: <b>{vip_days_left(user_id)}</b>
 
-<b>تسجيل لايف</b>
-<code>/live رابط_اللايف 60</code>
+فعّل كود VIP أو أرسل طلب VIP للأدمن.
 """
 
 
@@ -1389,6 +1455,48 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "redeem_code":
         set_state(context, "redeem_code")
         await q.edit_message_text("أرسل كود VIP الآن:", reply_markup=back_menu())
+        return
+
+
+    if data == "request_vip":
+        item = add_vip_request(q.from_user, "30")
+        await edit_html(
+            q,
+            f"<b>تم إرسال طلب VIP</b>\n\nسيتم التواصل معك من الأدمن.\nالأدمن: <b>{ADMIN_USERNAME}</b>",
+            reply_markup=vip_menu()
+        )
+        try:
+            for admin_id in (ADMIN_IDS + FALLBACK_ADMIN_IDS):
+                await context.bot.send_message(
+                    chat_id=int(admin_id),
+                    text=f"طلب VIP جديد\nID: {item['user_id']}\nName: {item['name']}\nUsername: @{item.get('username')}\nPackage: {item['package']}"
+                )
+        except Exception:
+            pass
+        return
+
+    if data == "watch_clear_all":
+        watch = load_watchlist()
+        watch[str(chat_id)] = []
+        save_watchlist(watch)
+        await edit_html(q, watch_panel_text(user_id, chat_id), reply_markup=watch_menu())
+        return
+
+    if data == "admin_vip_requests":
+        if is_admin(user_id):
+            await q.edit_message_text(vip_requests_text(), reply_markup=admin_vip_menu(), parse_mode="HTML")
+        return
+
+    if data == "admin_broadcast_free":
+        if is_admin(user_id):
+            set_state(context, "admin_broadcast_free")
+            await q.edit_message_text("أرسل نص الإعلان لمستخدمي Free فقط:", reply_markup=admin_ads_menu())
+        return
+
+    if data == "admin_broadcast_vip":
+        if is_admin(user_id):
+            set_state(context, "admin_broadcast_vip")
+            await q.edit_message_text("أرسل نص الإعلان لمستخدمي VIP فقط:", reply_markup=admin_ads_menu())
         return
 
     # ADMIN
@@ -1765,6 +1873,23 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_admin(user_id):
             set_ad(True, text)
             await update.message.reply_text("✅ تم تغيير الإعلان وتفعيله.", reply_markup=admin_menu())
+        return
+
+
+    if waiting == "admin_broadcast_free":
+        clear_state(context)
+        if is_admin(user_id):
+            msg = await update.message.reply_text("جاري إرسال الإعلان لمستخدمي Free...")
+            sent, failed = await broadcast_to_users_filtered(context.bot, text, "free")
+            await msg.edit_text(f"تم الإرسال.\nوصل: {sent}\nفشل: {failed}", reply_markup=admin_ads_menu())
+        return
+
+    if waiting == "admin_broadcast_vip":
+        clear_state(context)
+        if is_admin(user_id):
+            msg = await update.message.reply_text("جاري إرسال الإعلان لمستخدمي VIP...")
+            sent, failed = await broadcast_to_users_filtered(context.bot, text, "vip")
+            await msg.edit_text(f"تم الإرسال.\nوصل: {sent}\nفشل: {failed}", reply_markup=admin_ads_menu())
         return
 
     if waiting == "admin_broadcast":
@@ -2423,7 +2548,6 @@ def main():
     print(f"Startup cleanup: {startup_report}")
 
     print(f"{BOT_LOGO} {BOT_NAME} is running...")
-    threading.Thread(target=run_web_server, daemon=True).start()
     app.run_polling()
 
 
