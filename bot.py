@@ -5,6 +5,8 @@ import time
 import uuid
 import shutil
 import asyncio
+import threading
+from flask import Flask
 import subprocess
 from pathlib import Path
 
@@ -92,7 +94,23 @@ DEFAULT_SETTINGS = {
     "preferred_quality": "normal",  # normal / best
 }
 
+# =========================================================
+# RENDER WEB SERVER
+# =========================================================
 
+web_app = Flask(__name__)
+
+@web_app.get("/")
+def home():
+    return "TikSave Pro is running", 200
+
+@web_app.get("/health")
+def health():
+    return "OK", 200
+
+def run_web_server():
+    port = int(os.getenv("PORT", "10000"))
+    web_app.run(host="0.0.0.0", port=port)
 # =========================================================
 # JSON
 # =========================================================
@@ -2400,6 +2418,7 @@ def main():
     print(f"Startup cleanup: {startup_report}")
 
     print(f"{BOT_LOGO} {BOT_NAME} is running...")
+    threading.Thread(target=run_web_server, daemon=True).start()
     app.run_polling()
 
 
